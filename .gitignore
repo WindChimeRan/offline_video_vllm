@@ -1,0 +1,36 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# HuggingFace cache (large downloads live under scratch)
+hf_cache/
+
+# Extracted video files and zipped archives
+videos/
+*.mp4
+*.avi
+*.mkv
+*.webm
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Sampled subsets and per-run outputs
+samples/
+runs/
+
+# Runtime logs
+*.log
+
+# Editor / misc
+.DS_Store
+.ipynb_checkpoints/
+*.ipynb_checkpoints
