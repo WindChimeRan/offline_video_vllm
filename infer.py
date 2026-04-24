@@ -25,6 +25,11 @@ from vllm import LLM, SamplingParams
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 TARGET_FPS = 0.5
 MAX_FRAMES = 64
+# Per-frame pixel budget after resize (Qwen2-VL patch basis = 28*28).
+# 32*28*28 ≈ 25k pixels (~158×158) → floor so small clips don't upsample.
+# 256*28*28 ≈ 200k pixels (~448×448) → ceil so big clips (1080p MVBench) downsample.
+MIN_PIXELS = 32 * 28 * 28
+MAX_PIXELS = 256 * 28 * 28
 LETTERS = "ABCDE"
 
 VIDEOS_DIR = ROOT / "videos"
@@ -220,7 +225,11 @@ def main():
         tensor_parallel_size=1,
         trust_remote_code=True,
         allowed_local_media_path=str(VIDEOS_DIR.resolve()),
-        mm_processor_kwargs={"fps": TARGET_FPS},
+        mm_processor_kwargs={
+            "fps": TARGET_FPS,
+            "min_pixels": MIN_PIXELS,
+            "max_pixels": MAX_PIXELS,
+        },
         media_io_kwargs={"video": {"num_frames": MAX_FRAMES, "fps": TARGET_FPS}},
         disable_log_stats=False,  # needed so RequestOutput.metrics is populated
     )
