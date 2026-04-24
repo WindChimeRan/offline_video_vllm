@@ -23,8 +23,9 @@ os.environ.setdefault("HF_HUB_CACHE", str(CACHE_DIR / "hub"))
 from vllm import LLM, SamplingParams
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-TARGET_FPS = 0.5
-MAX_FRAMES = 64
+# Fixed uniform sampling: every clip gets exactly NUM_FRAMES frames. Deterministic
+# prefill size, more MM-cache-friendly than fps-based sampling.
+NUM_FRAMES = 16
 # Per-frame pixel budget after resize (Qwen2-VL patch basis = 28*28).
 # 32*28*28 ≈ 25k pixels (~158×158) → floor so small clips don't upsample.
 # 256*28*28 ≈ 200k pixels (~448×448) → ceil so big clips (1080p MVBench) downsample.
@@ -212,7 +213,8 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
     print(f"Model:   {MODEL_ID}")
-    print(f"fps:     {TARGET_FPS} (frames capped at {MAX_FRAMES})")
+    print(f"sampling: fixed num_frames={NUM_FRAMES} (uniform stride)")
+    print(f"pixels:  min={MIN_PIXELS} max={MAX_PIXELS}")
     print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
 
     t_load_start = time.perf_counter()
@@ -226,12 +228,19 @@ def main():
         trust_remote_code=True,
         allowed_local_media_path=str(VIDEOS_DIR.resolve()),
         mm_processor_kwargs={
-            "fps": TARGET_FPS,
+            "num_frames": NUM_FRAMES,
             "min_pixels": MIN_PIXELS,
             "max_pixels": MAX_PIXELS,
         },
-        media_io_kwargs={"video": {"num_frames": MAX_FRAMES, "fps": TARGET_FPS}},
+        media_io_kwargs={"video": {"num_frames": NUM_FRAMES}},
         disable_log_stats=False,  # needed so RequestOutput.metrics is populated
+        compilation_config={
+            # Qwen2.5-VL is explicitly supported for ViT torch.compile
+            # + CUDA-graph capture. The cudagraph path needs the fix from
+            # vllm PR #38997 (shipped in nightly 0.19.2rc1.dev165+g62b1bbe47).
+            "compile_mm_encoder": True,
+            "cudagraph_mm_encoder": True,
+        },
     )
     engine_load_s = time.perf_counter() - t_load_start
     print(f"Engine load: {engine_load_s:.1f} s")
@@ -242,8 +251,9 @@ def main():
 
     results = {
         "model": MODEL_ID,
-        "target_fps": TARGET_FPS,
-        "max_frames": MAX_FRAMES,
+        "num_frames": NUM_FRAMES,
+        "min_pixels": MIN_PIXELS,
+        "max_pixels": MAX_PIXELS,
         "max_tokens": 1,
         "engine_load_s": engine_load_s,
         "nextqa": run_dataset(llm, sp, nextqa_rows, run_dir / "nextqa.jsonl"),
