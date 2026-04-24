@@ -78,6 +78,30 @@ PRESETS: dict[str, dict] = {
             "cudagraph_mm_encoder": True,
         },
     },
+    "run5": {
+        # run4b + parallelize the CPU render phase. In 0.19.1 the engine-arg
+        # name is `renderer_num_workers` (default 1) — it sizes the
+        # ThreadPoolExecutor in vllm/renderers/base.py that runs the
+        # cv2 decode + HF video processor in parallel across requests.
+        # The MM processor cache isn't thread-safe, so we also disable it
+        # (`mm_processor_cache_gb=0`). Our hit rate was 1-3% anyway with
+        # mostly-unique videos.
+        "mm_processor_kwargs": {
+            "num_frames": NUM_FRAMES,
+            "min_pixels": MIN_PIXELS,
+            "max_pixels": MAX_PIXELS,
+        },
+        "media_io_kwargs": {"video": {"num_frames": NUM_FRAMES}},
+        "compilation_config": {
+            "compile_mm_encoder": True,
+            "cudagraph_mm_encoder": True,
+        },
+        # workers=2 was the sweet spot across a 1/2/4/8 sweep; see
+        # RENDERER_WORKERS_TUNING.md. 4+ regressed on NExTQA due to GIL +
+        # cv2 internal-threading contention.
+        "renderer_num_workers": 2,
+        "mm_processor_cache_gb": 0,
+    },
 }
 
 
@@ -249,9 +273,16 @@ def main():
     ap.add_argument("--preset", required=True, choices=list(PRESETS.keys()))
     ap.add_argument("--samples-dir", type=Path, default=ROOT / "samples" / "small")
     ap.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
+    ap.add_argument("--workers", type=int, default=None,
+                    help="override renderer_num_workers; when >1 also disables "
+                         "the mm processor cache (required for thread-safety).")
     args = ap.parse_args()
 
-    cfg = PRESETS[args.preset]
+    cfg = {**PRESETS[args.preset]}
+    if args.workers is not None:
+        cfg["renderer_num_workers"] = args.workers
+        if args.workers > 1:
+            cfg["mm_processor_cache_gb"] = 0
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = args.runs_dir / f"{ts}_{args.preset}"

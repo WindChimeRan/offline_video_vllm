@@ -11,6 +11,7 @@ Same presets as [`MINI_SPEED_LOG.md`](MINI_SPEED_LOG.md), re-run at 10× scale s
 | 2 | `run2`  | +`min_pixels=32*28²`, `max_pixels=256*28²` — caps 720p/1080p clips, NExTQA barely touched | 28.1 | **680.6** | **2.92** | 166.2 / 322.4 | 0.226 · 0.170 | 79.5% / 59.4% |
 | 3 | `run3`  | Drop `fps`, fix `num_frames=16` uniform (same pixel caps) | 33.0 | 714.6 | 2.78 | 173.8 / 339.0 | 0.139 · 0.435 | 79.8% / **64.8%** |
 | 4b | `run4b` | +`compile_mm_encoder=True`, `cudagraph_mm_encoder=True` (local shim over vllm PR #38997) | 39.4 | 693.6 | 2.87 | 169.6 / 329.0 | **0.122 · 0.317** | 79.4% / **65.1%** |
+| 5 | `run5`  | +`renderer_num_workers=2`, `mm_processor_cache_gb=0` (thread-safety). Picked after a 1/2/4/8 sweep — see [`RENDERER_WORKERS_TUNING.md`](RENDERER_WORKERS_TUNING.md). w=2 is the sweet spot (−3% wall, the whole win is on MVBench); w≥4 regresses from GIL + cv2-internal-threading contention. | 39.2 | **674.0** | **2.95** | 165.9 / 318.2 | 0.121 · 0.456 | 79.6% / 65.3% |
 
 _TTFT = arrival → first token (dominated by batch-queue wait in a single-shot batch). E2E = `last_token_ts − scheduled_ts`, monotonic clock, per-request inference time._
 
