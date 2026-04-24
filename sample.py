@@ -1,12 +1,19 @@
-"""Pick 100 examples from each dataset for the vLLM scoping run.
+"""Pick N examples from each dataset for a vLLM offline run.
 
-NExTQA: 100 random rows from config=MC / split=test.
-MVBench: stratified 5 per subtask × 20 subtasks = 100 rows (train split).
+NExTQA: N random rows from config=MC / split=test (up to 8564 available).
+MVBench: stratified N//18 per subtask × 18 usable subtasks.
 
-Writes samples/{nextqa,mvbench}.jsonl with the raw metadata we need downstream
-(video filename, question, candidates, gold answer, + subtask for MVBench).
+Two MVBench subtasks are skipped up front because their videos aren't usable
+via the llm.chat + file:// path:
+  - fine_grained_pose (NTU RGB+D, not redistributed on HF)
+  - episodic_reasoning (TVQA frames are pre-extracted directories, not videos)
+
+CLI:
+    uv run python sample.py --n 100  --out-dir samples/small
+    uv run python sample.py --n 1000 --out-dir samples/large
 """
 
+import argparse
 import json
 import os
 import random
@@ -22,20 +29,19 @@ os.environ["HF_HUB_CACHE"] = str(CACHE_DIR / "hub")
 from datasets import get_dataset_config_names, load_dataset
 
 SEED = 0
-N_PER_DATASET = 100
-OUT_DIR = ROOT / "samples"
-OUT_DIR.mkdir(exist_ok=True)
+SKIP_SUBTASKS = {"fine_grained_pose", "episodic_reasoning"}
 
 
-def sample_nextqa():
+def sample_nextqa(n: int, out_dir: Path):
     ds = load_dataset("lmms-lab/NExTQA", "MC", split="test")
     rng = random.Random(SEED)
-    idxs = rng.sample(range(len(ds)), N_PER_DATASET)
+    n = min(n, len(ds))
+    idxs = rng.sample(range(len(ds)), n)
     rows = []
     for i in idxs:
         ex = ds[i]
         candidates = [ex["a0"], ex["a1"], ex["a2"], ex["a3"], ex["a4"]]
-        gold_idx = int(ex["answer"])  # 0..4
+        gold_idx = int(ex["answer"])
         rows.append({
             "dataset": "nextqa",
             "row_index": i,
@@ -51,36 +57,26 @@ def sample_nextqa():
             "gold_letter": "ABCDE"[gold_idx],
             "answer": candidates[gold_idx],
         })
-    out = OUT_DIR / "nextqa.jsonl"
+    out = out_dir / "nextqa.jsonl"
     with open(out, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     print(f"nextqa: wrote {len(rows)} rows -> {out}")
-    print(f"  sample keys: {list(rows[0].keys())}")
-    print(f"  first row: {rows[0]}")
 
 
-def sample_mvbench():
-    subtasks = get_dataset_config_names("OpenGVLab/MVBench")
-    # Skip fine_grained_pose — its videos come from NTU RGB+D which is NOT
-    # redistributed on HF (README flags this). Keep the other 19 subtasks.
-    skip = {"fine_grained_pose"}
-    per_sub = N_PER_DATASET // len(subtasks)  # floor
-    extra = N_PER_DATASET - per_sub * len(subtasks)  # 100 = 5*20, so extra=0
-
+def sample_mvbench(n: int, out_dir: Path):
+    subtasks = [s for s in get_dataset_config_names("OpenGVLab/MVBench")
+                if s not in SKIP_SUBTASKS]
+    per_sub = n // len(subtasks)
     rng = random.Random(SEED)
     rows = []
-    dropped_subtasks = []
     for sub in subtasks:
-        if sub in skip:
-            dropped_subtasks.append(sub)
-            continue
         ds = load_dataset("OpenGVLab/MVBench", sub, split="train")
-        idxs = rng.sample(range(len(ds)), per_sub)
+        k = min(per_sub, len(ds))
+        idxs = rng.sample(range(len(ds)), k)
         for i in idxs:
             ex = ds[i]
             candidates = list(ex["candidates"])
-            # In MVBench, `answer` is the gold answer text; find its index.
             gold_idx = candidates.index(ex["answer"])
             row = {
                 "dataset": "mvbench",
@@ -93,25 +89,30 @@ def sample_mvbench():
                 "gold_letter": "ABCDE"[gold_idx],
                 "answer": ex["answer"],
             }
-            # optional temporal fields on a few subtasks
-            for k in ("start", "end", "accurate_start", "accurate_end"):
-                if k in ex:
-                    row[k] = ex[k]
+            for k_opt in ("start", "end", "accurate_start", "accurate_end"):
+                if k_opt in ex:
+                    row[k_opt] = ex[k_opt]
             rows.append(row)
 
-    out = OUT_DIR / "mvbench.jsonl"
+    out = out_dir / "mvbench.jsonl"
     with open(out, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
-    print(f"mvbench: wrote {len(rows)} rows -> {out}")
-    print(f"  dropped subtasks (NTU-licensed, not on HF): {dropped_subtasks}")
-    print(f"  first row: {rows[0]}")
+    print(f"mvbench: wrote {len(rows)} rows -> {out}  ({per_sub}/subtask × {len(subtasks)} subtasks)")
+    print(f"  skipped subtasks: {sorted(SKIP_SUBTASKS)}")
 
 
 def main():
-    sample_nextqa()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=100, help="target examples per dataset")
+    ap.add_argument("--out-dir", type=Path, default=ROOT / "samples" / "small",
+                    help="directory to write {nextqa,mvbench}.jsonl")
+    args = ap.parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_nextqa(args.n, args.out_dir)
     print()
-    sample_mvbench()
+    sample_mvbench(args.n, args.out_dir)
 
 
 if __name__ == "__main__":

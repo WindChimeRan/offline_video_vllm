@@ -3,7 +3,8 @@
 Scoping vLLM offline inference for video QA — Qwen2.5-VL-7B-Instruct over [NExTQA](https://huggingface.co/datasets/lmms-lab/NExTQA) (MC) and [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench).
 
 - [`infer.py`](infer.py) — the inference script (`llm.chat` + `file://` URLs, `mm_processor_kwargs={"fps":0.5}`, no hand-rolled decode).
-- [`SPEED_LOG.md`](SPEED_LOG.md) — per-tuning-iteration speed/accuracy log (TTFT, req/s, wall, E2E, accuracy).
+- [`MINI_SPEED_LOG.md`](MINI_SPEED_LOG.md) — small-scale (N≈190) tuning log.
+- [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — large-scale (N≈2000) tuning log.
 
 ## Quick start
 

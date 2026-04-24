@@ -1,13 +1,20 @@
-"""Run Qwen2.5-VL-7B-Instruct on the 100+95 sampled NExTQA / MVBench rows
-via vLLM's chat API. Videos are passed as `file://` URLs; vLLM's connector
-decodes them and the HF processor applies fps=0.5. No manual frame decode
-or prompt-template assembly.
+"""Run Qwen2.5-VL-7B-Instruct on sampled NExTQA / MVBench rows via vLLM's
+chat API. Videos are passed as `file://` URLs; vLLM's connector decodes them
+and the HF processor handles temporal sampling + normalization. No manual
+frame decoding or prompt-template assembly.
 
 - GPU 4 only (set CUDA_VISIBLE_DEVICES=4 before running).
 - max_tokens=1: only the single letter A/B/C/D/E is needed.
 - Per CLAUDE.md: no silent try/except.
+
+CLI:
+    python infer.py --preset run4b --samples-dir samples/small
+    python infer.py --preset run1  --samples-dir samples/large
+
+Presets correspond to rows in MINI_SPEED_LOG.md / LARGE_SPEED_LOG.md.
 """
 
+import argparse
 import datetime as dt
 import json
 import os
@@ -23,19 +30,55 @@ os.environ.setdefault("HF_HUB_CACHE", str(CACHE_DIR / "hub"))
 from vllm import LLM, SamplingParams
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-# Fixed uniform sampling: every clip gets exactly NUM_FRAMES frames. Deterministic
-# prefill size, more MM-cache-friendly than fps-based sampling.
-NUM_FRAMES = 16
-# Per-frame pixel budget after resize (Qwen2-VL patch basis = 28*28).
-# 32*28*28 ≈ 25k pixels (~158×158) → floor so small clips don't upsample.
-# 256*28*28 ≈ 200k pixels (~448×448) → ceil so big clips (1080p MVBench) downsample.
-MIN_PIXELS = 32 * 28 * 28
-MAX_PIXELS = 256 * 28 * 28
 LETTERS = "ABCDE"
 
 VIDEOS_DIR = ROOT / "videos"
-SAMPLES_DIR = ROOT / "samples"
 RUNS_DIR = ROOT / "runs"
+
+MIN_PIXELS = 32 * 28 * 28    # ~158 px/side floor; no upsampling of tiny clips
+MAX_PIXELS = 256 * 28 * 28   # ~448 px/side ceil; downsamples 720p/1080p
+NUM_FRAMES = 16              # fixed uniform sample budget
+
+# Each preset corresponds to one row in the SPEED_LOG tables.
+PRESETS: dict[str, dict] = {
+    "run1": {
+        "mm_processor_kwargs": {"fps": 0.5},
+        "media_io_kwargs": {"video": {"num_frames": 64, "fps": 0.5}},
+        "compilation_config": {},
+    },
+    "run2": {
+        "mm_processor_kwargs": {
+            "fps": 0.5,
+            "min_pixels": MIN_PIXELS,
+            "max_pixels": MAX_PIXELS,
+        },
+        "media_io_kwargs": {"video": {"num_frames": 64, "fps": 0.5}},
+        "compilation_config": {},
+    },
+    "run3": {
+        "mm_processor_kwargs": {
+            "num_frames": NUM_FRAMES,
+            "min_pixels": MIN_PIXELS,
+            "max_pixels": MAX_PIXELS,
+        },
+        "media_io_kwargs": {"video": {"num_frames": NUM_FRAMES}},
+        "compilation_config": {},
+    },
+    "run4b": {
+        "mm_processor_kwargs": {
+            "num_frames": NUM_FRAMES,
+            "min_pixels": MIN_PIXELS,
+            "max_pixels": MAX_PIXELS,
+        },
+        "media_io_kwargs": {"video": {"num_frames": NUM_FRAMES}},
+        "compilation_config": {
+            # Needs vllm PR #38997 import paths; local shim installed in
+            # .venv/.../vllm/v1/worker/gpu/mm/ for 0.19.1.
+            "compile_mm_encoder": True,
+            "cudagraph_mm_encoder": True,
+        },
+    },
+}
 
 
 def resolve_video(dataset: str, video_name: str) -> Path:
@@ -84,10 +127,6 @@ def load_samples(path: Path) -> list[dict]:
 
 
 def filter_to_real_files(rows: list[dict]) -> list[dict]:
-    """Drop rows whose 'video' resolves to a directory (e.g. MVBench's
-    episodic_reasoning uses TVQA frame-directories, not single mp4 files).
-    Prints every dropped row so nothing is lost silently.
-    """
     kept, dropped = [], []
     for r in rows:
         p = resolve_video(r["dataset"], r["video"])
@@ -134,12 +173,10 @@ def run_dataset(llm: LLM, sp: SamplingParams, rows: list[dict], out_path: Path) 
         ttft = None
         lat = None
         if m is not None:
-            # RequestStateStats mixes wall-clock (arrival_time) and monotonic
-            # (*_ts) fields; keep the clocks separate.
-            ttft = m.first_token_latency  # precomputed TTFT
+            ttft = m.first_token_latency
             ttfts.append(ttft)
             if m.last_token_ts and m.scheduled_ts:
-                lat = m.last_token_ts - m.scheduled_ts  # in-engine inference time
+                lat = m.last_token_ts - m.scheduled_ts
                 e2e_latencies.append(lat)
 
         records.append({
@@ -208,61 +245,61 @@ def run_dataset(llm: LLM, sp: SamplingParams, rows: list[dict], out_path: Path) 
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preset", required=True, choices=list(PRESETS.keys()))
+    ap.add_argument("--samples-dir", type=Path, default=ROOT / "samples" / "small")
+    ap.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
+    args = ap.parse_args()
+
+    cfg = PRESETS[args.preset]
+
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = RUNS_DIR / ts
+    run_dir = args.runs_dir / f"{ts}_{args.preset}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
-    print(f"Model:   {MODEL_ID}")
-    print(f"sampling: fixed num_frames={NUM_FRAMES} (uniform stride)")
-    print(f"pixels:  min={MIN_PIXELS} max={MAX_PIXELS}")
+    print(f"Preset : {args.preset}")
+    print(f"Model  : {MODEL_ID}")
+    print(f"Samples: {args.samples_dir}")
+    print(f"cfg    : {cfg}")
     print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
 
     t_load_start = time.perf_counter()
     llm = LLM(
         model=MODEL_ID,
-        max_model_len=32768,
+        # 64k is enough for uncapped Qwen2.5-VL video (up to ~37k vision
+        # tokens observed on 1080p MVBench clips with fps=0.5 + num_frames=64
+        # and no max_pixels). Capped presets use far less, but we set it
+        # once here so run1 baseline doesn't need a special case.
+        max_model_len=65536,
         limit_mm_per_prompt={"video": 1},
         dtype="bfloat16",
         gpu_memory_utilization=0.9,
         tensor_parallel_size=1,
         trust_remote_code=True,
         allowed_local_media_path=str(VIDEOS_DIR.resolve()),
-        mm_processor_kwargs={
-            "num_frames": NUM_FRAMES,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        media_io_kwargs={"video": {"num_frames": NUM_FRAMES}},
-        disable_log_stats=False,  # needed so RequestOutput.metrics is populated
-        compilation_config={
-            # Qwen2.5-VL is explicitly supported for ViT torch.compile
-            # + CUDA-graph capture. The cudagraph path needs the fix from
-            # vllm PR #38997 (shipped in nightly 0.19.2rc1.dev165+g62b1bbe47).
-            "compile_mm_encoder": True,
-            "cudagraph_mm_encoder": True,
-        },
+        disable_log_stats=False,
+        **cfg,
     )
     engine_load_s = time.perf_counter() - t_load_start
     print(f"Engine load: {engine_load_s:.1f} s")
     sp = SamplingParams(temperature=0.0, max_tokens=1)
 
-    nextqa_rows = filter_to_real_files(load_samples(SAMPLES_DIR / "nextqa.jsonl"))
-    mvbench_rows = filter_to_real_files(load_samples(SAMPLES_DIR / "mvbench.jsonl"))
+    nextqa_rows = filter_to_real_files(load_samples(args.samples_dir / "nextqa.jsonl"))
+    mvbench_rows = filter_to_real_files(load_samples(args.samples_dir / "mvbench.jsonl"))
 
     results = {
         "model": MODEL_ID,
-        "num_frames": NUM_FRAMES,
-        "min_pixels": MIN_PIXELS,
-        "max_pixels": MAX_PIXELS,
+        "preset": args.preset,
+        "samples_dir": str(args.samples_dir),
+        "config": cfg,
         "max_tokens": 1,
         "engine_load_s": engine_load_s,
         "nextqa": run_dataset(llm, sp, nextqa_rows, run_dir / "nextqa.jsonl"),
         "mvbench": run_dataset(llm, sp, mvbench_rows, run_dir / "mvbench.jsonl"),
     }
     with open(run_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=str)
     print(f"\nWrote {run_dir / 'results.json'}")
-    print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":
