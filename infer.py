@@ -107,13 +107,15 @@ PRESETS: dict[str, dict] = {
         "renderer_num_workers": 2,
         "mm_processor_cache_gb": 0,
     },
-    "run4b_kf_v2": {
-        # Smart keyframe sampling via pyav_keyframes_v2: one demux-only pass
-        # to enumerate keyframe PTS (no decode), then seek+decode only the
+    "run6": {
+        # run4b base + pyav_keyframes_v2 backend: one demux-only pass to
+        # enumerate keyframe PTS (no decode), then seek+decode only the
         # NUM_FRAMES keyframes we keep. Decode cost is O(NUM_FRAMES)
         # regardless of clip length. When K_total < NUM_FRAMES, oversamples
         # by duplicating keyframes (no fallback to B/P decode). Metadata
         # reports the true source-frame index of each returned keyframe.
+        # renderer_num_workers stays at 1 — run5's parallel trick doesn't
+        # compose because v2's per-clip decode is already 16-66 ms.
         "mm_processor_kwargs": {
             "num_frames": NUM_FRAMES,
             "min_pixels": MIN_PIXELS,
@@ -129,28 +131,6 @@ PRESETS: dict[str, dict] = {
             "compile_mm_encoder": True,
             "cudagraph_mm_encoder": True,
         },
-    },
-    "run4b_kf_v2_w2": {
-        # run4b_kf_v2 + renderer_num_workers=2 to compose the lossy decode
-        # win with run5's parallel-renderer win. mm_processor_cache_gb=0 is
-        # required for thread-safety when workers > 1.
-        "mm_processor_kwargs": {
-            "num_frames": NUM_FRAMES,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        "media_io_kwargs": {
-            "video": {
-                "num_frames": NUM_FRAMES,
-                "video_backend": "pyav_keyframes_v2",
-            },
-        },
-        "compilation_config": {
-            "compile_mm_encoder": True,
-            "cudagraph_mm_encoder": True,
-        },
-        "renderer_num_workers": 2,
-        "mm_processor_cache_gb": 0,
     },
 }
 

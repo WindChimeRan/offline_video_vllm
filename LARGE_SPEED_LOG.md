@@ -35,12 +35,12 @@ _TTFT = arrival → first token. E2E = `last_token_ts − scheduled_ts`. Workers
 
 To push past run5's CPU-decode floor, [`pyav_keyframe_backend.py`](pyav_keyframe_backend.py) ships `pyav_keyframes_v2`: one demux pass to enumerate keyframe PTS (no decode), then seek + decode only the `num_frames` keyframes we keep. No B/P decode ever; decode work is `O(num_frames)` regardless of clip length. When `K_total < num_frames`, oversample the available keyframes (balanced via `np.round(np.linspace(...))`); metadata reports the true source-frame index of each returned keyframe so the temporal positional encoding stays honest.
 
-`run4b_kf_v2` = run4b config + `media_io_kwargs.video.video_backend = "pyav_keyframes_v2"`, no extra workers:
+`run6` = run4b config + `media_io_kwargs.video.video_backend = "pyav_keyframes_v2"`, no extra workers:
 
 | Preset           | NExTQA wall · acc      | MVBench wall · acc      | Combined wall   | vs run4b cv2 |
 |------------------|-----------------------:|------------------------:|----------------:|-------------:|
 | run4b (cv2)      | 328.0 · 0.7960         | 340.9 · **0.6515**      | 668.9           | 1.00× |
-| **run4b_kf_v2**  | **183.4 · 0.7950**     | **197.1 · 0.5404**      | **380.5**       | **1.76× faster** |
+| **run6**  | **183.4 · 0.7950**     | **197.1 · 0.5404**      | **380.5**       | **1.76× faster** |
 
 Top MVBench subtask deltas vs cv2 — regression concentrates on motion/temporal-order tasks; non-motion subtasks are within ±2 pt or improve:
 
@@ -59,6 +59,6 @@ Top MVBench subtask deltas vs cv2 — regression concentrates on motion/temporal
 ## Verdict
 
 - **Motion-dense workloads** (action_*, moving_*, MVBench-style temporal reasoning) → `run5`: full accuracy, 1.55× over baseline `run1`.
-- **NExTQA-style scene / state / identity QA, lossy OK** → `run4b_kf_v2`: 2.75× over baseline `run1`, NExTQA preserved within noise, MVBench −6.3 pt overall (concentrated in subtasks that need intra-scene motion).
+- **NExTQA-style scene / state / identity QA, lossy OK** → `run6`: 2.75× over baseline `run1`, NExTQA preserved within noise, MVBench −6.3 pt overall (concentrated in subtasks that need intra-scene motion).
 
 Per-run artifacts: `runs/<timestamp>_<preset>/{nextqa,mvbench}.jsonl` + `results.json`.

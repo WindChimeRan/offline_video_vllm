@@ -3,7 +3,7 @@
 Scoping vLLM offline inference for video QA — Qwen2.5-VL-7B-Instruct over [NExTQA](https://huggingface.co/datasets/lmms-lab/NExTQA) (MC) and [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench).
 
 - [`infer.py`](infer.py) — the inference script (`llm.chat` + `file://` URLs, preset-driven config, no hand-rolled decode).
-- [`pyav_keyframe_backend.py`](pyav_keyframe_backend.py) — custom vLLM video loaders. Ships **`pyav_keyframes_v2`**, the keyframe-only sampler used by our final preset `run4b_kf_v2`: single demux pass to enumerate keyframe PTS, then seek + decode only the `num_frames` keyframes we keep. Decode work is `O(num_frames)` regardless of clip length.
+- [`pyav_keyframe_backend.py`](pyav_keyframe_backend.py) — custom vLLM video loaders. Ships **`pyav_keyframes_v2`**, the keyframe-only sampler used by our final preset `run6`: single demux pass to enumerate keyframe PTS, then seek + decode only the `num_frames` keyframes we keep. Decode work is `O(num_frames)` regardless of clip length.
 - [`MINI_SPEED_LOG.md`](MINI_SPEED_LOG.md) — small-scale (N≈190) tuning log.
 - [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — large-scale (N≈2000) tuning log + decode-backend exploration.
 
@@ -46,16 +46,16 @@ uv run python sample.py
 uv run python fetch_videos.py
 
 # 4. Run Qwen2.5-VL-7B-Instruct on GPU 4 (first run also pulls ~16 GB of weights)
-env CUDA_VISIBLE_DEVICES=4 uv run python infer.py --preset run4b_kf_v2
+env CUDA_VISIBLE_DEVICES=4 uv run python infer.py --preset run6
 ```
 
 Artifacts land under `runs/<timestamp>_<preset>/` as `{nextqa,mvbench}.jsonl` + `results.json` (per-row predictions, per-subtask accuracy, TTFT / E2E / throughput). Videos, HF cache, samples, and runs are all gitignored.
 
-## Final call: `run4b_kf_v2` (vs the `run1` baseline, N=1990)
+## Final call: `run6` (vs the `run1` baseline, N=1990)
 
 `run1` = the original starting point: `mm_processor_kwargs={"fps":0.5}`, `num_frames=64`, no pixel cap, no `torch.compile`/CUDA-graph on the ViT, cv2 default decode.
 
-| Metric              | `run1` (baseline) | **`run4b_kf_v2`** (final) | Change          |
+| Metric              | `run1` (baseline) | **`run6`** (final) | Change          |
 |---------------------|------------------:|--------------------------:|----------------:|
 | Combined wall (s)   | 1045.6            | **380.5**                 | **2.75× faster**|
 | Throughput (req/s)  | 1.90              | **5.23**                  | +175 %          |
@@ -63,6 +63,6 @@ Artifacts land under `runs/<timestamp>_<preset>/` as `{nextqa,mvbench}.jsonl` + 
 | NExTQA accuracy     | 0.799             | 0.795                     | −0.4 pt (noise) |
 | MVBench accuracy    | 0.603             | 0.540                     | −6.3 pt         |
 
-What `run4b_kf_v2` stacks together: `max_pixels=256·28²` (downsample 1080p clips), fixed `num_frames=16` (drop the `fps=0.5` policy), `compile_mm_encoder + cudagraph_mm_encoder` (ViT compile + CUDA-graphs), **`pyav_keyframes_v2`** as the video backend (keyframe-only sampling, never pays B/P decode cost). The MVBench drop is concentrated in motion-sensitive subtasks (`action_antonym`, `moving_*`, `object_existence`) — keyframe sampling can't capture intra-scene motion. NExTQA-style scene/state QA is unaffected. If your downstream task is motion-dense, stay on `run5` (cv2 + parallel renderer) for full MVBench accuracy at 1.55× speedup over baseline; full breakdown in [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md).
+What `run6` stacks together: `max_pixels=256·28²` (downsample 1080p clips), fixed `num_frames=16` (drop the `fps=0.5` policy), `compile_mm_encoder + cudagraph_mm_encoder` (ViT compile + CUDA-graphs), **`pyav_keyframes_v2`** as the video backend (keyframe-only sampling, never pays B/P decode cost). The MVBench drop is concentrated in motion-sensitive subtasks (`action_antonym`, `moving_*`, `object_existence`) — keyframe sampling can't capture intra-scene motion. NExTQA-style scene/state QA is unaffected. If your downstream task is motion-dense, stay on `run5` (cv2 + parallel renderer) for full MVBench accuracy at 1.55× speedup over baseline; full breakdown in [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md).
 
 Notes: MVBench's `episodic_reasoning` (TVQA frame-dirs) and `fine_grained_pose` (NTU RGB+D, manual download) are dropped — they're not shipped as single video files on HF.
