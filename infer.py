@@ -107,59 +107,13 @@ PRESETS: dict[str, dict] = {
         "renderer_num_workers": 2,
         "mm_processor_cache_gb": 0,
     },
-    # Three loader variants anchored at run4b for the apples-to-apples
-    # decode-path comparison. Same compile/cudagraph/pixel-cap settings
-    # as run4b; only the media_io_kwargs.video.video_backend differs.
-    "run4b_pyav": {
-        # PyAV seek-based decode — uniform num_frames indices like the
-        # default `opencv` backend, but each target frame is decoded from
-        # its nearest preceding keyframe via container.seek() rather than
-        # via sequential cap.grab(). Custom backend in
-        # pyav_keyframe_backend.py (ported from vllm 0.20.x's mixin).
-        "mm_processor_kwargs": {
-            "num_frames": NUM_FRAMES,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        "media_io_kwargs": {
-            "video": {
-                "num_frames": NUM_FRAMES,
-                "video_backend": "pyav_seek",
-            },
-        },
-        "compilation_config": {
-            "compile_mm_encoder": True,
-            "cudagraph_mm_encoder": True,
-        },
-    },
-    "run4b_kf": {
-        # PyAV keyframe-only decode — set skip_frame='NONKEY' on the codec
-        # context, iterate every keyframe, uniformly pick NUM_FRAMES. Clips
-        # with fewer keyframes than NUM_FRAMES fall back to pyav_seek so the
-        # processor still receives NUM_FRAMES frames.
-        "mm_processor_kwargs": {
-            "num_frames": NUM_FRAMES,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        "media_io_kwargs": {
-            "video": {
-                "num_frames": NUM_FRAMES,
-                "video_backend": "pyav_keyframes",
-            },
-        },
-        "compilation_config": {
-            "compile_mm_encoder": True,
-            "cudagraph_mm_encoder": True,
-        },
-    },
     "run4b_kf_v2": {
-        # Smart keyframe sampling: one demux-only pass to enumerate keyframe
-        # PTS (no decode), then seek+decode only the NUM_FRAMES keyframes we
-        # keep. Decode cost is O(NUM_FRAMES) regardless of clip length. Falls
-        # back to OpenCV uniform sampling when K_total < NUM_FRAMES (rather
-        # than the v1's slow per-target forward-decode), so the HF processor
-        # always receives NUM_FRAMES frames with honest metadata.
+        # Smart keyframe sampling via pyav_keyframes_v2: one demux-only pass
+        # to enumerate keyframe PTS (no decode), then seek+decode only the
+        # NUM_FRAMES keyframes we keep. Decode cost is O(NUM_FRAMES)
+        # regardless of clip length. When K_total < NUM_FRAMES, oversamples
+        # by duplicating keyframes (no fallback to B/P decode). Metadata
+        # reports the true source-frame index of each returned keyframe.
         "mm_processor_kwargs": {
             "num_frames": NUM_FRAMES,
             "min_pixels": MIN_PIXELS,
