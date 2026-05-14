@@ -18,16 +18,40 @@ The loader is a single file with no native code; importing the module is the ins
 
 2. **Get the file.** Copy `pyav_keyframe_backend.py` somewhere on `PYTHONPATH` — typically next to whatever script constructs `LLM(...)`. No `pip install`, no setup.py.
 
-3. **Wire it.** At the top of the script (must run **before** `LLM(...)` is constructed; otherwise the engine fails the registry lookup with `Extension class pyav_keyframes_v2 not found`):
+3. **Wire it.** Import the module (the registration is a side-effect of import; must run **before** `LLM(...)` or the engine fails the registry lookup with `Extension class pyav_keyframes_v2 not found`), then configure the LLM with the full run6 stack — the keyframe backend pulls its weight only alongside the pixel cap, the fixed `num_frames`, and the ViT compile/cudagraph:
    ```python
-   import pyav_keyframe_backend  # noqa: F401  -- import for side-effect (registers loader)
+   import pyav_keyframe_backend  # noqa: F401 — side-effect import (registers the loader)
+   from vllm import LLM
+
+   NUM_FRAMES = 16
+   MIN_PIXELS = 32 * 28 * 28      # ~158 px/side floor — no upsampling tiny clips
+   MAX_PIXELS = 256 * 28 * 28     # ~448 px/side ceil — downsamples 720p/1080p
 
    llm = LLM(
        model="Qwen/Qwen2.5-VL-7B-Instruct",
-       media_io_kwargs={"video": {"video_backend": "pyav_keyframes_v2", "num_frames": 16}},
-       ...
+       max_model_len=65536,
+       limit_mm_per_prompt={"video": 1},
+       dtype="bfloat16",
+       trust_remote_code=True,
+       allowed_local_media_path="/path/to/videos",   # if using file:// URLs
+       mm_processor_kwargs={
+           "num_frames": NUM_FRAMES,
+           "min_pixels": MIN_PIXELS,
+           "max_pixels": MAX_PIXELS,
+       },
+       media_io_kwargs={
+           "video": {
+               "num_frames": NUM_FRAMES,
+               "video_backend": "pyav_keyframes_v2",
+           },
+       },
+       compilation_config={
+           "compile_mm_encoder": True,
+           "cudagraph_mm_encoder": True,
+       },
    )
    ```
+   `num_frames` appears in both kwarg blocks intentionally: the value in `media_io_kwargs.video` tells our loader how many keyframes to return; the value in `mm_processor_kwargs` tells the HF processor (Qwen2.5-VL) what to expect. They must match.
 
 That's the whole install. **Caveat:** this is a *lossy* sampler — frames are placed on GOP boundaries (scene cuts), not uniform stride. NExTQA-style scene QA is unaffected; motion-sensitive subtasks of MVBench can drop 35–50 pt. See the "Final call" table below for the empirical tradeoff before deciding.
 
