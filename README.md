@@ -7,7 +7,31 @@ Scoping vLLM offline inference for video QA — Qwen2.5-VL-7B-Instruct over [NEx
 - [`MINI_SPEED_LOG.md`](MINI_SPEED_LOG.md) — small-scale (N≈190) tuning log.
 - [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — large-scale (N≈2000) tuning log + decode-backend exploration.
 
-## Quick start
+## Quick start — drop `pyav_keyframes_v2` into your own vLLM script
+
+The loader is a single file with no native code; importing the module is the installation (the `@VIDEO_LOADER_REGISTRY.register(...)` decorator runs at import time and adds the loader to vLLM's registry). Three steps:
+
+1. **Environment.** Need `av >= 12.0.0` (we use 17.0.1) and a `vllm` whose `vllm.multimodal.video` exposes `VIDEO_LOADER_REGISTRY` and `VideoLoader`. Verified on vllm 0.19.1 and 0.20.x. Sanity check:
+   ```sh
+   python -c "from vllm.multimodal.video import VIDEO_LOADER_REGISTRY, VideoLoader"
+   ```
+
+2. **Get the file.** Copy `pyav_keyframe_backend.py` somewhere on `PYTHONPATH` — typically next to whatever script constructs `LLM(...)`. No `pip install`, no setup.py.
+
+3. **Wire it.** At the top of the script (must run **before** `LLM(...)` is constructed; otherwise the engine fails the registry lookup with `Extension class pyav_keyframes_v2 not found`):
+   ```python
+   import pyav_keyframe_backend  # noqa: F401  -- import for side-effect (registers loader)
+
+   llm = LLM(
+       model="Qwen/Qwen2.5-VL-7B-Instruct",
+       media_io_kwargs={"video": {"video_backend": "pyav_keyframes_v2", "num_frames": 16}},
+       ...
+   )
+   ```
+
+That's the whole install. **Caveat:** this is a *lossy* sampler — frames are placed on GOP boundaries (scene cuts), not uniform stride. NExTQA-style scene QA is unaffected; motion-sensitive subtasks of MVBench can drop 35–50 pt. See the "Final call" table below for the empirical tradeoff before deciding.
+
+## Reproduce the benchmark in this repo
 
 Requirements: Python 3.11, `uv`, 1× GPU with ≥40 GB VRAM, ~50 GB free disk.
 
