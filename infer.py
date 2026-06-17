@@ -8,13 +8,14 @@ frame decoding or prompt-template assembly.
 - Per CLAUDE.md: no silent try/except.
 
 CLI:
-    python infer.py --preset run4b --samples-dir samples/small
-    python infer.py --preset run1  --samples-dir samples/large
+    python infer.py --preset baseline  --samples-dir samples/small
+    python infer.py --preset keyframes --samples-dir samples/large
 
-Presets correspond to rows in MINI_SPEED_LOG.md / LARGE_SPEED_LOG.md.
+The two presets correspond to the rows in LARGE_SPEED_LOG.md.
 """
 
 import argparse
+import copy
 import datetime as dt
 import json
 import os
@@ -31,7 +32,7 @@ from vllm import LLM, SamplingParams
 
 # Import-side-effect: registers "pyav_keyframes" against
 # vllm.multimodal.video.VIDEO_LOADER_REGISTRY. Must happen before LLM(...) is
-# constructed, otherwise the engine fails the lookup when run6 is selected.
+# constructed, or the engine fails the lookup when the keyframes preset runs.
 import pyav_keyframe_backend  # noqa: F401
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -44,53 +45,15 @@ MIN_PIXELS = 32 * 28 * 28    # ~158 px/side floor; no upsampling of tiny clips
 MAX_PIXELS = 256 * 28 * 28   # ~448 px/side ceil; downsamples 720p/1080p
 NUM_FRAMES = 16              # fixed uniform sample budget
 
-# Each preset corresponds to one row in the SPEED_LOG tables.
+# Two presets: `baseline` is the best lossless config (cv2 decode); `keyframes`
+# swaps in the pyav_keyframes loader. Their delta isolates the loader's effect.
+# See LARGE_SPEED_LOG.md.
 PRESETS: dict[str, dict] = {
-    "run1": {
-        "mm_processor_kwargs": {"fps": 0.5},
-        "media_io_kwargs": {"video": {"num_frames": 64, "fps": 0.5}},
-        "compilation_config": {},
-    },
-    "run2": {
-        "mm_processor_kwargs": {
-            "fps": 0.5,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        "media_io_kwargs": {"video": {"num_frames": 64, "fps": 0.5}},
-        "compilation_config": {},
-    },
-    "run3": {
-        "mm_processor_kwargs": {
-            "num_frames": NUM_FRAMES,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        "media_io_kwargs": {"video": {"num_frames": NUM_FRAMES}},
-        "compilation_config": {},
-    },
-    "run4b": {
-        "mm_processor_kwargs": {
-            "num_frames": NUM_FRAMES,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS,
-        },
-        "media_io_kwargs": {"video": {"num_frames": NUM_FRAMES}},
-        "compilation_config": {
-            # Needs vllm PR #38997 import paths; local shim installed in
-            # .venv/.../vllm/v1/worker/gpu/mm/ for 0.19.1.
-            "compile_mm_encoder": True,
-            "cudagraph_mm_encoder": True,
-        },
-    },
-    "run5": {
-        # run4b + parallelize the CPU render phase. In 0.19.1 the engine-arg
-        # name is `renderer_num_workers` (default 1) — it sizes the
-        # ThreadPoolExecutor in vllm/renderers/base.py that runs the
-        # cv2 decode + HF video processor in parallel across requests.
-        # The MM processor cache isn't thread-safe, so we also disable it
-        # (`mm_processor_cache_gb=0`). Our hit rate was 1-3% anyway with
-        # mostly-unique videos.
+    "baseline": {
+        # Best lossless pipeline: tuned pixel cap + fixed 16-frame budget +
+        # ViT compile/CUDA-graph + parallelized cv2 render. workers=2 was the
+        # sweet spot of a 1/2/4/8 sweep; it requires the (thread-unsafe) MM
+        # processor cache off.
         "mm_processor_kwargs": {
             "num_frames": NUM_FRAMES,
             "min_pixels": MIN_PIXELS,
@@ -101,21 +64,22 @@ PRESETS: dict[str, dict] = {
             "compile_mm_encoder": True,
             "cudagraph_mm_encoder": True,
         },
-        # workers=2 was the sweet spot across a 1/2/4/8 sweep; see
-        # RENDERER_WORKERS_TUNING.md. 4+ regressed on NExTQA due to GIL +
-        # cv2 internal-threading contention.
         "renderer_num_workers": 2,
         "mm_processor_cache_gb": 0,
     },
-    "run6": {
-        # run4b base + pyav_keyframes_v2 backend: one demux-only pass to
+    "keyframes": {
+        # baseline pipeline + the keyframe-only loader: one demux-only pass to
         # enumerate keyframe PTS (no decode), then seek+decode only the
-        # NUM_FRAMES keyframes we keep. Decode cost is O(NUM_FRAMES)
-        # regardless of clip length. When K_total < NUM_FRAMES, oversamples
-        # by duplicating keyframes (no fallback to B/P decode). Metadata
-        # reports the true source-frame index of each returned keyframe.
-        # renderer_num_workers stays at 1 — run5's parallel trick doesn't
-        # compose because v2's per-clip decode is already 16-66 ms.
+        # NUM_FRAMES keyframes we keep — decode cost is O(NUM_FRAMES)
+        # regardless of clip length. When K_total < NUM_FRAMES it oversamples
+        # by duplicating keyframes (never falls back to B/P decode); metadata
+        # reports each returned keyframe's true source index. Lossy: frames
+        # land on GOP boundaries, not a uniform stride.
+        #
+        # renderer_num_workers stays at the default 1 — the parallel-render
+        # trick doesn't compose (per-clip keyframe decode is already 16-66 ms,
+        # so thread coordination + the mandatory cache-off cost more than they
+        # save).
         "mm_processor_kwargs": {
             "num_frames": NUM_FRAMES,
             "min_pixels": MIN_PIXELS,
@@ -124,7 +88,7 @@ PRESETS: dict[str, dict] = {
         "media_io_kwargs": {
             "video": {
                 "num_frames": NUM_FRAMES,
-                "video_backend": "pyav_keyframes_v2",
+                "video_backend": "pyav_keyframes",
             },
         },
         "compilation_config": {
@@ -306,13 +270,23 @@ def main():
     ap.add_argument("--workers", type=int, default=None,
                     help="override renderer_num_workers; when >1 also disables "
                          "the mm processor cache (required for thread-safety).")
+    ap.add_argument("--num-frames", type=int, default=None,
+                    help="override the sampled frame budget; sets it in BOTH "
+                         "mm_processor_kwargs and media_io_kwargs.video so the "
+                         "HF processor and the video loader agree.")
     args = ap.parse_args()
 
-    cfg = {**PRESETS[args.preset]}
+    cfg = copy.deepcopy(PRESETS[args.preset])
     if args.workers is not None:
         cfg["renderer_num_workers"] = args.workers
         if args.workers > 1:
             cfg["mm_processor_cache_gb"] = 0
+    if args.num_frames is not None:
+        # Both blocks must carry the same value or the processor and the
+        # loader disagree on frame count. Fail loudly if a preset lacks the
+        # expected keys rather than silently papering over it.
+        cfg["mm_processor_kwargs"]["num_frames"] = args.num_frames
+        cfg["media_io_kwargs"]["video"]["num_frames"] = args.num_frames
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = args.runs_dir / f"{ts}_{args.preset}"
@@ -327,10 +301,9 @@ def main():
     t_load_start = time.perf_counter()
     llm = LLM(
         model=MODEL_ID,
-        # 64k is enough for uncapped Qwen2.5-VL video (up to ~37k vision
-        # tokens observed on 1080p MVBench clips with fps=0.5 + num_frames=64
-        # and no max_pixels). Capped presets use far less, but we set it
-        # once here so run1 baseline doesn't need a special case.
+        # 64k is ample headroom: both presets cap max_pixels and fix
+        # num_frames=16, so vision tokens stay well under this. Set once here
+        # for both.
         max_model_len=65536,
         limit_mm_per_prompt={"video": 1},
         dtype="bfloat16",

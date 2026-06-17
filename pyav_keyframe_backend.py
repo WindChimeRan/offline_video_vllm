@@ -1,6 +1,6 @@
 """Custom PyAV-based vLLM video loader for the 0.19.x API.
 
-Registers ``pyav_keyframes_v2`` against
+Registers ``pyav_keyframes`` against
 ``vllm.multimodal.video.VIDEO_LOADER_REGISTRY``:
 
 * Single demux pass to enumerate keyframe PTS (no decode), then seek+decode
@@ -46,8 +46,8 @@ def _pyav_metadata(container: "av.container.InputContainer") -> VideoSourceMetad
     return VideoSourceMetadata(total_frames, fps, duration)
 
 
-@VIDEO_LOADER_REGISTRY.register("pyav_keyframes_v2")
-class PyAVKeyframeBackendV2(VideoLoader):
+@VIDEO_LOADER_REGISTRY.register("pyav_keyframes")
+class PyAVKeyframeBackend(VideoLoader):
     """Pure keyframe-only sampling for lossy video acceleration.
 
     Strategy:
@@ -76,7 +76,7 @@ class PyAVKeyframeBackendV2(VideoLoader):
     scene/identity QA where temporal coverage isn't the signal.
     """
 
-    _backend_name: ClassVar[str] = "pyav_keyframes_v2"
+    _backend_name: ClassVar[str] = "pyav_keyframes"
 
     @classmethod
     def load_bytes(
@@ -112,7 +112,7 @@ class PyAVKeyframeBackendV2(VideoLoader):
 
             if n_kf == 0:
                 raise ValueError(
-                    "pyav_keyframes_v2: no keyframes found in bitstream"
+                    "pyav_keyframes: no keyframes found in bitstream"
                 )
 
             if num_frames < 0:
@@ -142,7 +142,7 @@ class PyAVKeyframeBackendV2(VideoLoader):
                     # can't produce a frame after seeking to it — that's a
                     # corrupted bitstream, not something to silently absorb.
                     raise ValueError(
-                        f"pyav_keyframes_v2: keyframe pts={tpts} demuxed "
+                        f"pyav_keyframes: keyframe pts={tpts} demuxed "
                         "but no frame decoded; bitstream may be corrupt"
                     )
                 pts_to_frame[tpts] = frame.to_ndarray(format="rgb24")

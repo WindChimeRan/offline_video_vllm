@@ -12,6 +12,10 @@ wheels/
 # HuggingFace cache (large downloads live under scratch)
 hf_cache/
 
+# Provisioned CUDA 12.8 toolkit (+ .cuda128_std symlink view) for the
+# vllm-main from-source build (multi-GB)
+.cuda128*/
+
 # Extracted video files and zipped archives
 videos/
 *.mp4
@@ -29,6 +33,9 @@ runs/
 
 # Runtime logs
 *.log
+
+# Local archives — pruned journey docs kept for local reference, not shipped
+*.backup
 
 # Editor / misc
 .DS_Store

@@ -1,92 +1,98 @@
 # video_vllm
 
-Scoping vLLM offline inference for video QA — Qwen2.5-VL-7B-Instruct over [NExTQA](https://huggingface.co/datasets/lmms-lab/NExTQA) (MC) and [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench).
+Offline vLLM video-QA on [NExTQA](https://huggingface.co/datasets/lmms-lab/NExTQA) (MC) and [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench), Qwen2.5-VL-7B-Instruct.
 
-- [`infer.py`](infer.py) — the inference script (`llm.chat` + `file://` URLs, preset-driven config, no hand-rolled decode).
-- [`pyav_keyframe_backend.py`](pyav_keyframe_backend.py) — custom vLLM video loaders. Ships **`pyav_keyframes_v2`**, the keyframe-only sampler used by our final preset `run6`: single demux pass to enumerate keyframe PTS, then seek + decode only the `num_frames` keyframes we keep. Decode work is `O(num_frames)` regardless of clip length.
-- [`MINI_SPEED_LOG.md`](MINI_SPEED_LOG.md) — small-scale (N≈190) tuning log.
-- [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — large-scale (N≈2000) tuning log + decode-backend exploration.
+The contribution is **`pyav_keyframes`** — a lossy, keyframe-only vLLM video loader that bounds decode cost by the frame budget regardless of clip length. Upstreamed as [vllm-project/vllm#45203](https://github.com/vllm-project/vllm/pull/45203).
 
-## Quick start — drop `pyav_keyframes_v2` into your own vLLM script
+- [`pyav_keyframe_backend.py`](pyav_keyframe_backend.py) — the loader (registers `pyav_keyframes`).
+- [`infer.py`](infer.py) — the eval harness (`llm.chat` + `file://` URLs, two presets).
+- [`upstream_bench/bench_real_loader.py`](upstream_bench/bench_real_loader.py) — synthetic decode-speed microbench (GPU-free).
+- [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — `baseline` vs `keyframes` results (N=1990).
 
-The loader is a single file with no native code; importing the module is the installation (the `@VIDEO_LOADER_REGISTRY.register(...)` decorator runs at import time and adds the loader to vLLM's registry). Three steps:
+## What `pyav_keyframes` does
 
-1. **Environment.** Need `av >= 12.0.0` (we use 17.0.1) and a `vllm` whose `vllm.multimodal.video` exposes `VIDEO_LOADER_REGISTRY` and `VideoLoader`. Verified on vllm 0.19.1 and 0.20.x. Sanity check:
-   ```sh
-   python -c "from vllm.multimodal.video import VIDEO_LOADER_REGISTRY, VideoLoader"
-   ```
+One demux-only pass enumerates keyframe (I-frame) PTS — packet headers only, no
+decode — then it seek+decodes *only* the `num_frames` keyframes it keeps. No P/B
+frame is ever decoded, so decode cost is `O(num_frames)` whatever the clip
+length. If a clip has fewer keyframes than `num_frames`, the available keyframes
+are oversampled (balanced duplication) rather than falling back to non-keyframe
+decode; `frames_indices` reports each returned keyframe's true source index, so
+temporal positional encoding stays honest.
 
-2. **Get the file.** Copy `pyav_keyframe_backend.py` somewhere on `PYTHONPATH` — typically next to whatever script constructs `LLM(...)`. No `pip install`, no setup.py.
+**Lossy:** returned frames sit on GOP boundaries (scene cuts), not a uniform
+stride. Scene/state QA is unaffected; motion- and temporal-order tasks degrade
+(see [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md)).
 
-3. **Wire it.** Import the module (the registration is a side-effect of import; must run **before** `LLM(...)` or the engine fails the registry lookup with `Extension class pyav_keyframes_v2 not found`), then configure the LLM with the full run6 stack — the keyframe backend pulls its weight only alongside the pixel cap, the fixed `num_frames`, and the ViT compile/cudagraph:
-   ```python
-   import pyav_keyframe_backend  # noqa: F401 — side-effect import (registers the loader)
-   from vllm import LLM
+## Quick start — drop `pyav_keyframes` into your own vLLM script
 
-   NUM_FRAMES = 16
-   MIN_PIXELS = 32 * 28 * 28      # ~158 px/side floor — no upsampling tiny clips
-   MAX_PIXELS = 256 * 28 * 28     # ~448 px/side ceil — downsamples 720p/1080p
+The loader is a single file, no native code; importing the module *is* the
+install (the `@VIDEO_LOADER_REGISTRY.register(...)` decorator runs at import
+time). Needs `av >= 12.0.0` (we use 17.0.1) and a vllm whose
+`vllm.multimodal.video` exposes `VIDEO_LOADER_REGISTRY` and `VideoLoader`
+(verified on 0.19.1 and 0.20.x). Import the module **before** `LLM(...)` — or the
+engine fails the registry lookup — then point the loader at it:
 
-   llm = LLM(
-       model="Qwen/Qwen2.5-VL-7B-Instruct",
-       max_model_len=65536,
-       limit_mm_per_prompt={"video": 1},
-       dtype="bfloat16",
-       trust_remote_code=True,
-       allowed_local_media_path="/path/to/videos",   # if using file:// URLs
-       mm_processor_kwargs={
-           "num_frames": NUM_FRAMES,
-           "min_pixels": MIN_PIXELS,
-           "max_pixels": MAX_PIXELS,
-       },
-       media_io_kwargs={
-           "video": {
-               "num_frames": NUM_FRAMES,
-               "video_backend": "pyav_keyframes_v2",
-           },
-       },
-       compilation_config={
-           "compile_mm_encoder": True,
-           "cudagraph_mm_encoder": True,
-       },
-   )
-   ```
-   `num_frames` appears in both kwarg blocks intentionally: the value in `media_io_kwargs.video` tells our loader how many keyframes to return; the value in `mm_processor_kwargs` tells the HF processor (Qwen2.5-VL) what to expect. They must match.
+```python
+import pyav_keyframe_backend  # noqa: F401 — side-effect import (registers the loader)
+from vllm import LLM
 
-That's the whole install. **Caveat:** this is a *lossy* sampler — frames are placed on GOP boundaries (scene cuts), not uniform stride. NExTQA-style scene QA is unaffected; motion-sensitive subtasks of MVBench can drop 35–50 pt. See the "Final call" table below for the empirical tradeoff before deciding.
+NUM_FRAMES = 16
+llm = LLM(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    max_model_len=65536,
+    limit_mm_per_prompt={"video": 1},
+    dtype="bfloat16",
+    trust_remote_code=True,
+    allowed_local_media_path="/path/to/videos",   # if using file:// URLs
+    mm_processor_kwargs={"num_frames": NUM_FRAMES, "max_pixels": 256 * 28 * 28},
+    media_io_kwargs={"video": {"num_frames": NUM_FRAMES, "video_backend": "pyav_keyframes"}},
+    compilation_config={"compile_mm_encoder": True, "cudagraph_mm_encoder": True},
+)
+```
 
-## Reproduce the benchmark in this repo
+`num_frames` appears in both kwarg blocks intentionally: the value in
+`media_io_kwargs.video` tells the loader how many keyframes to return; the one in
+`mm_processor_kwargs` tells the HF processor what to expect. They must match.
+
+> Once #45203 merges, this loader ships inside vllm as `pyav_keyframes` — drop
+> this file and just set `VLLM_VIDEO_LOADER_BACKEND=pyav_keyframes` (or the
+> `video_backend` kwarg above).
+
+## Reproduce the benchmark
 
 Requirements: Python 3.11, `uv`, 1× GPU with ≥40 GB VRAM, ~50 GB free disk.
 
 ```sh
-# 1. Install deps
-uv sync
+uv sync                                   # install deps
+uv run python sample.py                   # pick the NExTQA + MVBench subset (seed=0)
+uv run python fetch_videos.py             # download + extract videos (~24 GB)
 
-# 2. Pick 100 NExTQA + 95 MVBench rows (deterministic, seed=0)
-uv run python sample.py
-
-# 3. Download + extract the videos (~24 GB; skips NTU-licensed fine_grained_pose)
-uv run python fetch_videos.py
-
-# 4. Run Qwen2.5-VL-7B-Instruct on GPU 4 (first run also pulls ~16 GB of weights)
-env CUDA_VISIBLE_DEVICES=4 uv run python infer.py --preset run6
+# best lossless pipeline vs keyframe-only loader
+env CUDA_VISIBLE_DEVICES=0 uv run python infer.py --preset baseline
+env CUDA_VISIBLE_DEVICES=0 uv run python infer.py --preset keyframes
 ```
 
-Artifacts land under `runs/<timestamp>_<preset>/` as `{nextqa,mvbench}.jsonl` + `results.json` (per-row predictions, per-subtask accuracy, TTFT / E2E / throughput). Videos, HF cache, samples, and runs are all gitignored.
+Artifacts land under `runs/<timestamp>_<preset>/` as `{nextqa,mvbench}.jsonl` +
+`results.json` (per-row predictions, per-subtask accuracy, TTFT / E2E /
+throughput). Videos, HF cache, samples, and runs are gitignored.
 
-## Final call: `run6` (vs the `run1` baseline, N=1990)
+The decode-speed microbench needs no GPU and no videos:
 
-`run1` = the original starting point: `mm_processor_kwargs={"fps":0.5}`, `num_frames=64`, no pixel cap, no `torch.compile`/CUDA-graph on the ViT, cv2 default decode.
+```sh
+uv run python upstream_bench/bench_real_loader.py
+```
 
-| Metric              | `run1` (baseline) | **`run6`** (final) | Change          |
-|---------------------|------------------:|--------------------------:|----------------:|
-| Combined wall (s)   | 1045.6            | **380.5**                 | **2.75× faster**|
-| Throughput (req/s)  | 1.90              | **5.23**                  | +175 %          |
-| TTFT mean (s)       | 252.5             | **91.4**                  | −64 %           |
-| NExTQA accuracy     | 0.799             | 0.795                     | −0.4 pt (noise) |
-| MVBench accuracy    | 0.603             | 0.540                     | −6.3 pt         |
+## Result (N=1990)
 
-What `run6` stacks together: `max_pixels=256·28²` (downsample 1080p clips), fixed `num_frames=16` (drop the `fps=0.5` policy), `compile_mm_encoder + cudagraph_mm_encoder` (ViT compile + CUDA-graphs), **`pyav_keyframes_v2`** as the video backend (keyframe-only sampling, never pays B/P decode cost). The MVBench drop is concentrated in motion-sensitive subtasks (`action_antonym`, `moving_*`, `object_existence`) — keyframe sampling can't capture intra-scene motion. NExTQA-style scene/state QA is unaffected. If your downstream task is motion-dense, stay on `run5` (cv2 + parallel renderer) for full MVBench accuracy at 1.55× speedup over baseline; full breakdown in [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md).
+| Preset | Wall (s) | req/s | NExTQA | MVBench |
+|---|---:|---:|---:|---:|
+| `baseline` (cv2, lossless) | 674.0 | 2.95 | 79.6% | 65.3% |
+| **`keyframes`** (lossy) | **380.5** | **5.23** | 79.5% | **54.0%** |
 
-Notes: MVBench's `episodic_reasoning` (TVQA frame-dirs) and `fine_grained_pose` (NTU RGB+D, manual download) are dropped — they're not shipped as single video files on HF.
+**1.77× throughput, NExTQA within noise (−0.1 pt), MVBench −11.3 pt** —
+concentrated in motion / temporal-order subtasks (`action_antonym` −52.7 pt).
+Full breakdown and verdict in [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md).
+
+Notes: MVBench's `episodic_reasoning` (TVQA frame-dirs) and `fine_grained_pose`
+(NTU RGB+D, manual download) are dropped — not shipped as single video files on
+HF.

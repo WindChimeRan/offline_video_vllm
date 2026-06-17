@@ -1,58 +1,64 @@
-# Speed Log — vLLM Offline Inference (Large)
+# Speed Log — `baseline` vs `keyframes`
 
 **Setup:** Qwen/Qwen2.5-VL-7B-Instruct · 1× A100-80GB · bf16 · `max_tokens=1` · `max_model_len=65536`
-**Data:** NExTQA MC test (1000) + MVBench stratified 55/subtask × 18 subtasks (990). Total **N = 1990**.
+**Data:** NExTQA MC test (1000) + MVBench stratified 55/subtask × 18 subtasks (990). **N = 1990.**
 
-Same presets as [`MINI_SPEED_LOG.md`](MINI_SPEED_LOG.md), re-run at 10× scale so engine-load is amortized and per-request wins surface in wall time.
+Two presets, identical except for the video loader (and the parallel-render
+trick only the lossless path can use). The delta is the cost/benefit of the
+`pyav_keyframes` keyframe-only loader on top of an already-optimized pipeline.
 
-| #  | Preset | Config delta                                                  | Engine | Wall   | req/s | TTFT mean / p95 | E2E (NExT · MVB) | Acc NExT / MVB    |
-|----|--------|----------------------------------------------------------------|------:|-------:|------:|----------------:|-----------------:|-------------------|
-| 1  | run1   | Baseline: `fps=0.5`, `num_frames=64`, no pixel cap             | 41.0  | 1045.6 | 1.90  | 252.5 / 480.7   | 0.51 · 2.13      | 79.9% / 60.3%     |
-| 2  | run2   | +`min/max_pixels` caps (downsamples 720p/1080p)                | 28.1  | 680.6  | 2.92  | 166.2 / 322.4   | 0.23 · 0.17      | 79.5% / 59.4%     |
-| 3  | run3   | Drop `fps`; fix `num_frames=16` uniform                        | 33.0  | 714.6  | 2.78  | 173.8 / 339.0   | 0.14 · 0.44      | 79.8% / **64.8%** |
-| 4b | run4b  | +`compile_mm_encoder` + `cudagraph_mm_encoder`                 | 39.4  | 693.6  | 2.87  | 169.6 / 329.0   | **0.12 · 0.32**  | 79.4% / **65.1%** |
-| 5  | run5   | +`renderer_num_workers=2`, `mm_processor_cache_gb=0`           | 39.2  | 674.0  | 2.95  | 165.9 / 318.2   | 0.12 · 0.46      | 79.6% / 65.3%     |
-| 6  | run6   | Swap cv2 → `pyav_keyframes_v2` (keyframe-only, lossy); drop workers | 44.8 | **380.5** | **5.23** | 87.0 / 167.2 | 0.24 · 2.72 | 79.5% / 54.0%     |
+- **`baseline`** — best lossless config: cv2 decode, `max_pixels=256·28²`, fixed
+  `num_frames=16`, ViT `compile_mm_encoder`/`cudagraph_mm_encoder`, parallel
+  renderer (`renderer_num_workers=2`).
+- **`keyframes`** — same pipeline, `video_backend=pyav_keyframes` (keyframe-only,
+  lossy). Renderer workers drop to the default 1 (they don't compose with
+  keyframe decode — see below).
 
-_TTFT = arrival → first token (NExTQA-only). E2E = `last_token_ts − scheduled_ts`. run6 E2E is high because faster CPU decode lets the engine batch more aggressively — per-request latency goes up while throughput goes up. Workers sweep behind run5 is in [`RENDERER_WORKERS_TUNING.md`](RENDERER_WORKERS_TUNING.md)._
+| Preset | Loader | Wall (s) | req/s | TTFT mean / p95 (s) | NExTQA | MVBench |
+|---|---|---:|---:|---:|---:|---:|
+| `baseline` | cv2 (lossless) | 674.0 | 2.95 | 165.9 / 318.2 | 79.6% | 65.3% |
+| **`keyframes`** | pyav_keyframes (lossy) | **380.5** | **5.23** | **87.0 / 167.2** | 79.5% | 54.0% |
+| **Δ** | | **1.77× faster** | **+77%** | | **−0.1 pt** | **−11.3 pt** |
 
-## Key levers
+> Numbers are from the prior run (these rows were captured under the old
+> `run5` / `run6` names). A clean back-to-back co-run under the renamed presets
+> is pending. Git history (and the local `*.backup` files) keep the full
+> `run1 → run6` tuning journey that found this `baseline`.
 
-- **`max_pixels=256·28²` is the biggest single lever** (run1→run2: −35 % wall). Resize cost scales with pixel count; downsampling 1080p before the HF processor touches it is the entire story.
-- **Fixed `num_frames=16`** (run2→run3) trades 5 % wall for +5.4 pt MVBench. Short MVBench clips were starved at `fps=0.5`.
-- **ViT compile + CUDA-graphs** (run3→run4b) trim per-request E2E 12-27 % but **wall is flat** — CPU rendering dominates, GPU is no longer the bottleneck.
-- **Wall is CPU-bound from run2 onward.** Once `max_pixels` is tuned, MVBench's GPU phase is <2 s out of ~340 s wall:
+## The trade-off
 
-  |        | MVBench render (CPU, single-thread) | MVBench engine (GPU) | % render |
-  |--------|---:|---:|---:|
-  | run1   | 518 s | 43 s | 92 % |
-  | run2   | 280 s | <1 s | ~100 % |
-  | run3   | 352 s | <2 s | ~100 % |
-  | run4b  | ~315 s | <2 s | ~100 % |
+`pyav_keyframes` does one demux-only pass to enumerate keyframe PTS, then
+seek+decodes only the `num_frames` keyframes it keeps — decode cost is
+`O(num_frames)` regardless of clip length, and no B/P frame is ever decoded.
+The cost is temporal accuracy: frames land on GOP boundaries (scene cuts), not a
+uniform stride. NExTQA-style scene/state QA is unaffected; the MVBench loss
+concentrates in motion / temporal-order subtasks:
 
-  Further speedup has to come from cheaper preprocessing — parallelize the renderer (`run5`), change the video backend (decord / torchcodec / keyframe-only), or pre-cache decoded frames.
-
-## On run6 (lossy keyframe sampling)
-
-run6 is the only row that trades accuracy for speed. The backend ([`pyav_keyframe_backend.py`](pyav_keyframe_backend.py)) does one demux pass to enumerate keyframe PTS (no decode), then seek + decode only the `num_frames` keyframes we keep. No B/P decode ever; decode work is `O(num_frames)` regardless of clip length. When `K_total < num_frames`, oversamples the available keyframes (balanced via `np.round(np.linspace(...))`); metadata reports the true source-frame index of each returned keyframe so temporal positional encoding stays honest.
-
-The accuracy drop concentrates on motion/temporal-order MVBench subtasks; non-motion subtasks are within ±2 pt or *improve* over cv2:
-
-| Subtask                      | Δacc vs cv2      |
-|------------------------------|-----------------:|
-| `action_antonym`             | **−52.7 pt**     |
-| `moving_attribute`           | −36.4 pt         |
-| `object_existence`           | −36.4 pt         |
-| `moving_count`               | −23.6 pt         |
-| `counterfactual_inference`   | −23.6 pt         |
-| **`action_prediction`**      | **+7.3 pt**      |
+| Subtask | Δ acc vs `baseline` |
+|---|---:|
+| `action_antonym` | **−52.7 pt** |
+| `moving_attribute` | −36.4 pt |
+| `object_existence` | −36.4 pt |
+| `moving_count` | −23.6 pt |
+| `counterfactual_inference` | −23.6 pt |
+| `action_prediction` | **+7.3 pt** |
 | `character_order`, `fine_grained_action` | +3.6 pt |
 
-**`renderer_num_workers > 1` doesn't compose with v2** — adding workers=2 regressed combined wall 9 % (380 → 416 s). v2's per-clip decode is already 16-66 ms; thread coordination + the mandatory `mm_processor_cache_gb=0` cost more than the parallelism wins. Workers help only when single-thread decode is the bottleneck.
+10 of 18 MVBench subtasks stay within ±2 pt.
 
 ## Verdict
 
-- **Motion-dense workloads** (action_*, moving_*, MVBench-style temporal reasoning) → `run5`: full accuracy, 1.55× over baseline `run1`.
-- **NExTQA-style scene / state / identity QA, lossy OK** → `run6`: 2.75× over baseline `run1`, NExTQA preserved within noise, MVBench −6.3 pt overall (concentrated in subtasks that need intra-scene motion).
+- **Scene / state / identity QA, lossy OK** (e.g. NExTQA) → `keyframes`: 1.77×
+  throughput, accuracy within noise.
+- **Motion-dense / temporal-order** (`action_*`, `moving_*`) → `baseline`: full
+  lossless accuracy.
+
+## Decode-speed microbench
+
+The throughput gain above is end-to-end (HF resize/normalize still runs on every
+frame, so it's smaller than the raw decode gain). For the isolated decode
+cost — near-constant for keyframes vs growing with clip length for lossless
+full-decode — see
+[`upstream_bench/bench_real_loader.py`](upstream_bench/bench_real_loader.py).
 
 Per-run artifacts: `runs/<timestamp>_<preset>/{nextqa,mvbench}.jsonl` + `results.json`.
