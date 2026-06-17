@@ -1,64 +1,73 @@
-# Speed Log — `baseline` vs `keyframes`
+# Speed Log — faithful 3-way video-loader comparison (Qwen2.5-VL)
 
-**Setup:** Qwen/Qwen2.5-VL-7B-Instruct · 1× A100-80GB · bf16 · `max_tokens=1` · `max_model_len=65536`
-**Data:** NExTQA MC test (1000) + MVBench stratified 55/subtask × 18 subtasks (990). **N = 1990.**
+**Setup:** Qwen/Qwen2.5-VL-7B-Instruct · 1× A100-80GB · bf16 · `max_tokens=1` ·
+`max_model_len=65536` · `enforce_eager` · vLLM `0.23.1rc1+gdf07fd276` (from
+source, cu128) · torch 2.11.0+cu128.
+**Data:** NExTQA MC test (1000) + MVBench 55/subtask × 18 (990). **N = 1990.**
+**Harness:** [`bench_matrix.py`](bench_matrix.py) (one cell per `(model, loader)`).
 
-Two presets, identical except for the video loader (and the parallel-render
-trick only the lossless path can use). The delta is the cost/benefit of the
-`pyav_keyframes` keyframe-only loader on top of an already-optimized pipeline.
+Three loaders, identical resolution/engine settings — the only varied factor is
+the frame-sampling strategy:
 
-- **`baseline`** — best lossless config: cv2 decode, `max_pixels=256·28²`, fixed
-  `num_frames=16`, ViT `compile_mm_encoder`/`cudagraph_mm_encoder`, parallel
-  renderer (`renderer_num_workers=2`).
-- **`keyframes`** — same pipeline, `video_backend=pyav_keyframes` (keyframe-only,
-  lossy). Renderer workers drop to the default 1 (they don't compose with
-  keyframe decode — see below).
+- **`opencv`** — vLLM default, uniform `num_frames=32`. What Qwen2.5-VL silently
+  falls back to today (it ships no `video_processor_type`).
+- **`faithful`** — the processor-mapped `qwen2_vl` loader, fps=2 (matches HF
+  transformers byte-for-byte). The correct baseline, added by
+  [vllm-project/vllm#45555](https://github.com/vllm-project/vllm/pull/45555).
+- **`keyframes`** — `pyav_keyframes`, keyframe-only `num_frames=16` (lossy, ours,
+  [#45203](https://github.com/vllm-project/vllm/pull/45203)).
 
-| Preset | Loader | Wall (s) | req/s | TTFT mean / p95 (s) | NExTQA | MVBench |
-|---|---|---:|---:|---:|---:|---:|
-| `baseline` | cv2 (lossless) | 674.0 | 2.95 | 165.9 / 318.2 | 79.6% | 65.3% |
-| **`keyframes`** | pyav_keyframes (lossy) | **380.5** | **5.23** | **87.0 / 167.2** | 79.5% | 54.0% |
-| **Δ** | | **1.77× faster** | **+77%** | | **−0.1 pt** | **−11.3 pt** |
+| Loader | NExTQA | MVBench | NExTQA req/s | MVBench req/s |
+|---|---:|---:|---:|---:|
+| `opencv` (uniform-32, default) | 81.1% | 66.8% | 1.98 | 1.93 |
+| **`faithful`** (`qwen2_vl`, fps=2) | **82.7%** | **67.7%** | 1.06 | 1.73 |
+| **`keyframes`** (kf-16, ours) | 79.6% | 53.2% | **5.58** | **5.14** |
 
-> Numbers are from the prior run (these rows were captured under the old
-> `run5` / `run6` names). A clean back-to-back co-run under the renamed presets
-> is pending. Git history (and the local `*.backup` files) keep the full
-> `run1 → run6` tuning journey that found this `baseline`.
+## The trade-off (vs the faithful baseline)
 
-## The trade-off
+`pyav_keyframes` vs `qwen2_vl` — the honest, apples-to-apples comparison
+(#45203's accuracy cost should be stated against #45555's groundtruth, not the
+uniform-32 default):
 
-`pyav_keyframes` does one demux-only pass to enumerate keyframe PTS, then
-seek+decodes only the `num_frames` keyframes it keeps — decode cost is
-`O(num_frames)` regardless of clip length, and no B/P frame is ever decoded.
-The cost is temporal accuracy: frames land on GOP boundaries (scene cuts), not a
-uniform stride. NExTQA-style scene/state QA is unaffected; the MVBench loss
+| | NExTQA | MVBench | NExTQA req/s | MVBench req/s |
+|---|---:|---:|---:|---:|
+| **Δ keyframes − faithful** | **−3.1 pt** | **−14.4 pt** | **5.2×** | **3.0×** |
+
+NExTQA (scene/state QA) is within ~3 pt; the MVBench cost is real and
 concentrates in motion / temporal-order subtasks:
 
-| Subtask | Δ acc vs `baseline` |
+| Subtask | Δ acc (keyframes − faithful) |
 |---|---:|
-| `action_antonym` | **−52.7 pt** |
-| `moving_attribute` | −36.4 pt |
-| `object_existence` | −36.4 pt |
-| `moving_count` | −23.6 pt |
-| `counterfactual_inference` | −23.6 pt |
-| `action_prediction` | **+7.3 pt** |
-| `character_order`, `fine_grained_action` | +3.6 pt |
+| `action_antonym` | **−47.3 pt** (83.6% → 36.4%) |
+| `moving_attribute` | −38.2 pt (94.5% → 56.4%) |
+| `object_existence` | −36.4 pt (92.7% → 56.4%) |
+| `counterfactual_inference` | −29.1 pt (69.1% → 40.0%) |
+| `object_interaction` | −27.3 pt (80.0% → 52.7%) |
+| `moving_direction` | −20.0 pt (52.7% → 32.7%) |
+| `moving_count` | −18.2 pt (67.3% → 49.1%) |
 
-10 of 18 MVBench subtasks stay within ±2 pt.
+Note the default `opencv` (uniform-32) is itself ~1 pt below `faithful` — even
+the "lossless" default under-samples relative to the correct fps=2 policy, which
+is the gap #45555 closes.
 
 ## Verdict
 
-- **Scene / state / identity QA, lossy OK** (e.g. NExTQA) → `keyframes`: 1.77×
-  throughput, accuracy within noise.
-- **Motion-dense / temporal-order** (`action_*`, `moving_*`) → `baseline`: full
-  lossless accuracy.
+- **Scene / state / identity QA, throughput-bound** → `keyframes`: ~4× the
+  faithful baseline's throughput, NExTQA within ~3 pt.
+- **Motion / temporal-order** (`action_*`, `moving_*`) → `faithful`: full
+  accuracy.
 
-## Decode-speed microbench
+## Notes
 
-The throughput gain above is end-to-end (HF resize/normalize still runs on every
-frame, so it's smaller than the raw decode gain). For the isolated decode
-cost — near-constant for keyframes vs growing with clip length for lossless
-full-decode — see
-[`upstream_bench/bench_real_loader.py`](upstream_bench/bench_real_loader.py).
+- req/s is per-dataset under `enforce_eager` (no ViT compile / CUDA-graph), so
+  absolute numbers are lower than a compiled engine; the **relative** loader
+  comparison is the result. The keyframe decode win is CPU-side (no P/B decode),
+  independent of the GPU engine config.
+- **Qwen3-VL is deferred.** On the same harness/build it sits at ~0.42
+  (near-chance) regardless of `_C` rebuild or transformers version (5.6.2 ≡
+  5.12.1), while Qwen2.5-VL is correct — a Qwen3-VL-specific issue still open
+  (see [`QWEN3_VL_DEFERRED.md`](QWEN3_VL_DEFERRED.md)). The faithful loader for
+  Qwen3-VL is the separate `qwen3_vl` (#44412).
 
-Per-run artifacts: `runs/<timestamp>_<preset>/{nextqa,mvbench}.jsonl` + `results.json`.
+Per-run artifacts: `runs/<ts>_<model>_<loader>/results.json`. Aggregate with
+[`aggregate_matrix.py`](aggregate_matrix.py).

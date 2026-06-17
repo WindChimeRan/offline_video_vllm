@@ -5,9 +5,10 @@ Offline vLLM video-QA on [NExTQA](https://huggingface.co/datasets/lmms-lab/NExTQ
 The contribution is **`pyav_keyframes`** — a lossy, keyframe-only vLLM video loader that bounds decode cost by the frame budget regardless of clip length. Upstreamed as [vllm-project/vllm#45203](https://github.com/vllm-project/vllm/pull/45203).
 
 - [`pyav_keyframe_backend.py`](pyav_keyframe_backend.py) — the loader (registers `pyav_keyframes`).
-- [`infer.py`](infer.py) — the eval harness (`llm.chat` + `file://` URLs, two presets).
+- [`bench_matrix.py`](bench_matrix.py) — 3-loader eval harness (opencv / faithful `qwen2_vl` / `pyav_keyframes`); [`aggregate_matrix.py`](aggregate_matrix.py) builds the table.
+- [`infer.py`](infer.py) — shared `llm.chat` harness helpers (reused by `bench_matrix.py`).
 - [`upstream_bench/bench_real_loader.py`](upstream_bench/bench_real_loader.py) — synthetic decode-speed microbench (GPU-free).
-- [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — `baseline` vs `keyframes` results (N=1990).
+- [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md) — faithful 3-way results (N=1990).
 
 ## What `pyav_keyframes` does
 
@@ -67,12 +68,16 @@ uv sync                                   # install deps
 uv run python sample.py                   # pick the NExTQA + MVBench subset (seed=0)
 uv run python fetch_videos.py             # download + extract videos (~24 GB)
 
-# best lossless pipeline vs keyframe-only loader
-env CUDA_VISIBLE_DEVICES=0 uv run python infer.py --preset baseline
-env CUDA_VISIBLE_DEVICES=0 uv run python infer.py --preset keyframes
+# faithful 3-way (needs a vllm exposing the qwen2_vl loader, #45555; we used a
+# from-source 0.23.1rc1 cu128 build — see LARGE_SPEED_LOG.md for the setup)
+for L in opencv faithful keyframes; do
+  env CUDA_VISIBLE_DEVICES=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
+    .venv/bin/python bench_matrix.py --model qwen2.5 --loader "$L" --samples-dir samples/large
+done
+.venv/bin/python aggregate_matrix.py      # build the 3-way table
 ```
 
-Artifacts land under `runs/<timestamp>_<preset>/` as `{nextqa,mvbench}.jsonl` +
+Artifacts land under `runs/<timestamp>_<model>_<loader>/` as `{nextqa,mvbench}.jsonl` +
 `results.json` (per-row predictions, per-subtask accuracy, TTFT / E2E /
 throughput). Videos, HF cache, samples, and runs are gitignored.
 
@@ -82,16 +87,19 @@ The decode-speed microbench needs no GPU and no videos:
 uv run python upstream_bench/bench_real_loader.py
 ```
 
-## Result (N=1990)
+## Result — faithful 3-way (Qwen2.5-VL, N=1990)
 
-| Preset | Wall (s) | req/s | NExTQA | MVBench |
+Three loaders, identical resolution/engine settings (vLLM 0.23.1rc1, `enforce_eager`); only the frame-sampling differs:
+
+| Loader | NExTQA | MVBench | NExTQA req/s | MVBench req/s |
 |---|---:|---:|---:|---:|
-| `baseline` (cv2, lossless) | 674.0 | 2.95 | 79.6% | 65.3% |
-| **`keyframes`** (lossy) | **380.5** | **5.23** | 79.5% | **54.0%** |
+| `opencv` (uniform-32, default) | 81.1% | 66.8% | 1.98 | 1.93 |
+| **`faithful`** (`qwen2_vl`, fps=2) | **82.7%** | **67.7%** | 1.06 | 1.73 |
+| **`keyframes`** (ours) | 79.6% | 53.2% | **5.58** | **5.14** |
 
-**1.77× throughput, NExTQA within noise (−0.1 pt), MVBench −11.3 pt** —
-concentrated in motion / temporal-order subtasks (`action_antonym` −52.7 pt).
-Full breakdown and verdict in [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md).
+Against the **faithful** baseline ([#45555](https://github.com/vllm-project/vllm/pull/45555) — the groundtruth for #45203), `pyav_keyframes` costs **−3.1 pt NExTQA / −14.4 pt MVBench** for **~3–5× throughput**, the MVBench loss concentrated in motion / temporal-order subtasks (`action_antonym` −47.3 pt). Full breakdown in [`LARGE_SPEED_LOG.md`](LARGE_SPEED_LOG.md).
+
+> **Qwen3-VL is deferred** — near-chance on this build for a still-open Qwen3-VL-specific reason (`_C` rebuild and transformers version both ruled out).
 
 Notes: MVBench's `episodic_reasoning` (TVQA frame-dirs) and `fine_grained_pose`
 (NTU RGB+D, manual download) are dropped — not shipped as single video files on

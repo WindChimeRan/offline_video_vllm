@@ -37,6 +37,9 @@ runs/
 # Local archives — pruned journey docs kept for local reference, not shipped
 *.backup
 
+# PR description drafts — disk-only, for review, never committed
+*_DRAFT.md
+
 # Editor / misc
 .DS_Store
 .ipynb_checkpoints/
